@@ -1,0 +1,11 @@
+# Toggl Auto-Fill CLI — Configuration
+# Copy this file and fill in your real values,
+# or override any setting via environment variables.
+
+workday_hours: 8
+day_start_time: "09:00"
+billable: true
+default_projects:
+  - "Your Project Name"
+time_off_project: "Time Off"
+daily_standup_mins: 15
