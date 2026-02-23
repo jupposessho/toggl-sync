@@ -9,3 +9,9 @@ default_projects:
   - "Your Project Name"
 time_off_project: "Time Off"
 daily_standup_mins: 15
+
+# Minimum gap (in minutes) to consider for filling and break gaps before existing entries
+min_gap_mins: 15
+
+# Maximum continuous work session length (in minutes) before forcing a break gap
+max_continuous_work_mins: 180

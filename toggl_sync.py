@@ -49,6 +49,8 @@ DAY_START_TIME     = _cfg_get("day_start_time",     "DAY_START_TIME",     "09:15
 BILLABLE           = _cfg_get("billable",           "BILLABLE",           True,    lambda v: v.lower() == "true")
 TIME_OFF_PROJECT   = _cfg_get("time_off_project",   "TIME_OFF_PROJECT",   "Time Off - (UNPAID)")
 DAILY_STANDUP_MINS = _cfg_get("daily_standup_mins", "DAILY_STANDUP_MINS", 15,      int)
+MIN_GAP_MINS       = _cfg_get("min_gap_mins",       "MIN_GAP_MINS",       15,      int)
+MAX_CONTINUOUS_WORK_MINS = _cfg_get("max_continuous_work_mins", "MAX_CONTINUOUS_WORK_MINS", 180, int)
 
 # DEFAULT_PROJECTS: comma-separated env var → list, or list from yaml
 _dp_env = os.getenv("DEFAULT_PROJECTS")
@@ -212,6 +214,113 @@ def insert_breaks(entries, break_secs=900):
     return result
 
 
+# ─── Gap-aware scheduling helpers ───────────────────────────────────────────────
+def _get_existing_intervals(existing_entries):
+    intervals = []
+    for e in existing_entries:
+        start_str = e.get("start", "")
+        if not start_str:
+            continue
+        dur = e.get("duration", 0)
+        if dur < 0:
+            continue
+        try:
+            st = datetime.datetime.fromisoformat(start_str).astimezone(TZ)
+        except ValueError:
+            continue
+        end_t = st + datetime.timedelta(seconds=max(dur, 0))
+        intervals.append((st, end_t))
+    intervals.sort(key=lambda x: x[0])
+    merged = []
+    for st, end_t in intervals:
+        if not merged:
+            merged.append([st, end_t])
+        else:
+            last = merged[-1]
+            if st <= last[1]:
+                if end_t > last[1]:
+                    last[1] = end_t
+            else:
+                merged.append([st, end_t])
+    return [(m[0], m[1]) for m in merged]
+
+
+def build_fill_slots(date, existing_entries, min_gap_secs):
+    day_start_dt = datetime.datetime.combine(date, DAY_START, tzinfo=TZ)
+    intervals = _get_existing_intervals(existing_entries)
+    slots = []
+
+    if intervals:
+        first_start = intervals[0][0]
+        pre_gap_secs = int((first_start - day_start_dt).total_seconds())
+        if pre_gap_secs >= min_gap_secs:
+            slots.append({"start": day_start_dt, "duration": pre_gap_secs})
+
+    for i in range(1, len(intervals)):
+        prev_end = intervals[i - 1][1]
+        next_start = intervals[i][0]
+        gap_secs = int((next_start - prev_end).total_seconds())
+        if gap_secs >= min_gap_secs:
+            slots.append({"start": prev_end, "duration": gap_secs})
+
+    if intervals:
+        slots.append({"start": intervals[-1][1], "duration": None})
+    else:
+        slots.append({"start": day_start_dt, "duration": None})
+    return slots
+
+
+def schedule_entries_into_slots(entries, slots, break_gap_secs=MIN_GAP_MINS * 60, max_continuous_work_secs=MAX_CONTINUOUS_WORK_MINS * 60):
+    if not slots:
+        return []
+    schedule = []
+    trimmed_work_secs = 0
+    slot_idx = 0
+    slot_start = slots[0]["start"]
+    slot_remaining = slots[0]["duration"]
+    for entry in entries:
+        remaining = entry["duration"]
+        is_break = entry.get("_is_break")
+        while remaining > 0 and slot_idx < len(slots):
+            extra_trim = 0
+            if slot_remaining is None:
+                dur = remaining
+            else:
+                if slot_remaining <= 0:
+                    slot_idx += 1
+                    if slot_idx >= len(slots):
+                        break
+                    slot_start = slots[slot_idx]["start"]
+                    slot_remaining = slots[slot_idx]["duration"]
+                    continue
+                dur = min(remaining, slot_remaining)
+                if (not is_break
+                    and remaining <= slot_remaining
+                    and remaining >= max_continuous_work_secs
+                    and slot_remaining > break_gap_secs):
+                    dur = remaining - break_gap_secs
+                    extra_trim = break_gap_secs
+                    trimmed_work_secs += break_gap_secs
+            e = dict(entry)
+            e["start"] = slot_start
+            e["duration"] = dur
+            schedule.append(e)
+            slot_start = slot_start + datetime.timedelta(seconds=dur)
+            remaining -= dur
+            if extra_trim:
+                remaining -= extra_trim
+            if slot_remaining is not None:
+                slot_remaining -= dur
+        if slot_idx >= len(slots):
+            break
+    if trimmed_work_secs > 0:
+        for i in range(len(schedule) - 1, -1, -1):
+            if not schedule[i].get("_is_break"):
+                schedule[i]["duration"] += trimmed_work_secs
+                break
+    return schedule
+
+
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def fmt_duration(secs):
@@ -289,19 +398,8 @@ def fill_day(date: datetime.date, existing_entries, activities, projects):
     if remaining_secs <= 0:
         return
 
-    # Find cursor = end of last existing entry (or day start)
-    cursor_dt = datetime.datetime.combine(date, DAY_START, tzinfo=TZ)
-    for e in existing_entries:
-        start_str = e.get("start", "")
-        dur = e.get("duration", 0)
-        if dur > 0 and start_str:
-            try:
-                st = datetime.datetime.fromisoformat(start_str).astimezone(TZ)
-                end_t = st + datetime.timedelta(seconds=dur)
-                if end_t > cursor_dt:
-                    cursor_dt = end_t
-            except ValueError:
-                pass
+    min_gap_secs = MIN_GAP_MINS * 60
+    fill_slots = build_fill_slots(date, existing_entries, min_gap_secs)
 
     print(f"\n  ── {date.strftime('%A %d %b')} — {fmt_duration(remaining_secs)} to fill ──")
     new_entries = []
@@ -361,22 +459,40 @@ def fill_day(date: datetime.date, existing_entries, activities, projects):
     # Insert breaks for long entries
     new_entries = insert_breaks(new_entries)
 
-    # Assign sequential start times from cursor
-    schedule = []
-    t = cursor_dt
-    for entry in new_entries:
-        e = dict(entry)
-        e["start"] = t
-        schedule.append(e)
-        t += datetime.timedelta(seconds=entry["duration"])
+    # Assign start times into available gaps, then after the last entry
+    schedule = schedule_entries_into_slots(
+        new_entries,
+        fill_slots,
+        break_gap_secs=min_gap_secs,
+        max_continuous_work_secs=MAX_CONTINUOUS_WORK_MINS * 60,
+    )
+    if not schedule:
+        print("  Skipping day — no gaps large enough to fill.")
+        return
 
-    # Display planned entries
+    # Display planned entries (including existing)
+    existing_display = []
+    for e in existing_entries:
+        start_str = e.get("start", "")
+        dur = e.get("duration", 0)
+        if dur < 0 or not start_str:
+            continue
+        try:
+            st = datetime.datetime.fromisoformat(start_str).astimezone(TZ)
+        except ValueError:
+            continue
+        desc = e.get("description") or "(no description)"
+        existing_display.append({"start": st, "duration": dur, "description": desc, "_existing": True})
+
+    combined = sorted(existing_display + schedule, key=lambda x: x["start"])
+
     print(f"\n  Planned for {date.strftime('%a %d %b')}:")
     total_new = 0
-    for s in schedule:
+    for s in combined:
         mins = s["duration"] // 60
-        print(f"    {s['start'].strftime('%H:%M')} | {mins:3}m | {s['description']}")
-        if not s.get("_is_break"):
+        suffix = " (existing)" if s.get("_existing") else ""
+        print(f"    {s['start'].strftime('%H:%M')} | {mins:3}m | {s['description']}{suffix}")
+        if not s.get("_is_break") and not s.get("_existing"):
             total_new += s["duration"]
     total_all = already_logged + total_new
     print(f"  Total: {fmt_duration(total_all)}  (was {fmt_duration(already_logged)}, adding {fmt_duration(total_new)})")
